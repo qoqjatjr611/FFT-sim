@@ -1,15 +1,7 @@
-﻿#include <complex>
+﻿#include "tfhe.h"
 #include <iostream>
-#include <valarray>
 
-const double PI = 3.141592653589793238460;
-
-typedef std::complex<double> Complex;
-typedef std::valarray<Complex> CArray;
-
-// Cooley–Tukey FFT (in-place, divide-and-conquer)
-// Higher memory requirements and redundancy although more intuitive
-void fft(CArray& x)
+void Realfft(CArray& x, CArray& y)
 {
 	const size_t N = x.size();
 	if (N <= 1) return;
@@ -19,55 +11,141 @@ void fft(CArray& x)
 	CArray  odd = x[std::slice(1, N / 2, 2)];
 
 	// conquer
-	fft(even);
-	fft(odd);
+	Realfft(even, even);
+	Realfft(odd, odd);
 
 	// combine
 	for (size_t k = 0; k < N / 2; ++k)
 	{
-		Complex t = std::polar(1.0, -2 * PI * k / N) * odd[k];
-		x[k] = even[k] + t;
-		x[k + N / 2] = even[k] - t;
+		Complex a = Complex(std::polar(1.0, -2 * PI * k / N)) * odd[k];
+		y[k] = even[k] + a;
+		y[k + N / 2] = even[k] - a;
+	}
+}
+
+void fft(TorusPolynomial* A, const LagrangeHalfCPolynomial* B) {
+	Complex* test = new Complex[A->N];
+	for (int i = 0; i < A->N; i++)
+		test[i] = *((Complex*)B->data + i);
+	CArray data(test, A->N);
+	CArray result;
+	result.resize(A->N);
+	Realfft(data, result);
+	Complex k(0.5, 0);
+	for (int i = 0; i < A->N; i++) {
+		if (real(result[i]) < 0)
+			* (A->coefsT + i) = int32_t(real(result[i] - k));
+		else
+			*(A->coefsT + i) = int32_t(real(result[i] + k));
 	}
 }
 
 // inverse fft (in-place)
-void ifft(CArray& x)
-{
-	// conjugate the complex numbers
-	x = x.apply(std::conj);
+void Realifft(int n, CArray& x, CArray& y) {
+	{
+		std::cout << n << std::endl;
+		// n=1 return
+		if (n == 1) {
+			y[0] = x[0];
+			return;
+		}
+		CArray A, B, C, D;
+		A.resize(n / 2);
+		B.resize(n / 2);
+		C.resize(n / 2);
+		D.resize(n / 2);
 
-	// forward fft
-	fft(x);
+		//divide
+		for (int k = 0; k < n / 2; ++k) {
+			Complex a(0.5, 0);
+			Complex b = Complex(std::polar(0.5, 2 * PI * k / n));
+			A[k] = x[k] * a + x[k + n / 2] * a;
+			B[k] = (b * x[k] - x[k + n / 2] * b);
+		}
+		//couquer
+		Realifft(n / 2, A, C);
+		Realifft(n / 2, B, D);
 
-	// conjugate the complex numbers again
-	x = x.apply(std::conj);
-
-	// scale the numbers
-	x /= x.size();
+		//combine
+		for (int k = 0; k < n / 2; ++k) {
+			y[2 * k] = C[k];
+			y[2 * k + 1] = D[k];
+		}
+	}
+}
+void ifft(int n, LagrangeHalfCPolynomial* a, IntPolynomial* b) {
+	Complex* test = new Complex[n];
+	for (int i = 0; i < n; i++)
+		test[i] = Complex(*(b->coefs + i));
+	CArray data(test, n);
+	CArray result;
+	result.resize(n);
+	Realifft(n, data, result);
+	for (int i = 0; i < n; i++)
+		* ((Complex*)a->data + i) = result[i];
 }
 
-int main1()
-{
-	const Complex test[] = { 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0 };
-	CArray data(test, 8);
+void tLweToFFTConvert(TLweSampleFFT* result, const TLweSample* source, const TLweParams* params) {
+	const int32_t k = params->k;
 
-	// forward fft
-	fft(data);
+	for (int32_t i = 0; i <= k; ++i)
+		fft(result->a + i, source->a + i);
+	result->current_variance = source->current_variance;
+}
 
-	std::cout << "fft" << std::endl;
-	for (int i = 0; i < 8; ++i)
-	{
-		std::cout << data[i] << std::endl;
+void tGswFFTExternMulToTLwe(TLweSample* accum, const TGswSampleFFT* gsw, const TGswParams* params) {
+	const TLweParams* tlwe_params = params->tlwe_params;
+	const int32_t k = tlwe_params->k;
+	const int32_t l = params->l;
+	const int32_t kpl = params->kpl;
+	const int32_t N = tlwe_params->N;
+	//TODO attention, improve these new/delete...
+	IntPolynomial* deca = new_IntPolynomial_array(kpl, N); //decomposed accumulator
+	LagrangeHalfCPolynomial* decaFFT = new_LagrangeHalfCPolynomial_array(kpl, N); //fft version
+	TLweSampleFFT* tmpa = new_TLweSampleFFT(tlwe_params);
+
+	for (int32_t i = 0; i <= k; i++)
+		tGswTorus32PolynomialDecompH(deca + i * l, accum->a + i, params);
+	for (int32_t p = 0; p < kpl; p++)
+		ifft(N, decaFFT + p, deca + p);
+
+	tLweFFTClear(tmpa, tlwe_params);
+	for (int32_t p = 0; p < kpl; p++) {
+		tLweFFTAddMulRTo(tmpa, decaFFT + p, gsw->all_samples + p, tlwe_params);
+	}
+	tLweFromFFTConvert(accum, tmpa, tlwe_params);
+
+	delete_TLweSampleFFT(tmpa);
+	delete_LagrangeHalfCPolynomial_array(kpl, decaFFT);
+	delete_IntPolynomial_array(kpl, deca);
+}
+
+
+
+int main() {
+	const int32_t nb_samples = 50;
+	const Torus32 mu_boot = modSwitchToTorus32(1, 8);
+
+	// generate params 
+	int32_t minimum_lambda = 100;
+	TFheGateBootstrappingParameterSet* params = new_default_gate_bootstrapping_parameters(minimum_lambda);
+	const LweParams* in_out_params = params->in_out_params;
+	// generate the secret keyset
+	TFheGateBootstrappingSecretKeySet* keyset = new_random_gate_bootstrapping_secret_keyset(params);
+
+	// generate input samples
+	LweSample* test_in = new_LweSample_array(nb_samples, in_out_params);
+	for (int32_t i = 0; i < nb_samples; ++i) {
+		lweSymEncrypt(test_in + i, modSwitchToTorus32(i, nb_samples), 0.01, keyset->lwe_key);
+	}
+	// output samples
+	LweSample* test_out = new_LweSample_array(nb_samples, in_out_params);
+
+
+	// bootstrap input samples
+	for (int32_t i = 0; i < nb_samples; ++i) {
+		tfhe_bootstrap_FFT(test_out + i, keyset->cloud.bkFFT, mu_boot, test_in + i);
 	}
 
-	// inverse fft
-	ifft(data);
-
-	std::cout << std::endl << "ifft" << std::endl;
-	for (int i = 0; i < 8; ++i)
-	{
-		std::cout << data[i] << std::endl;
-	}
 	return 0;
 }
